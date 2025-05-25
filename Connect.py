@@ -11,7 +11,10 @@ import time
 import sys
 import os
 import argparse
-from typing import Optional
+import ipaddress
+import subprocess
+import re
+from typing import Optional, List
 
 # Импорты для разных ОС
 if sys.platform.startswith('win'):
@@ -28,6 +31,74 @@ else:
     import serial
     import fcntl
     import termios
+
+def get_local_networks() -> List[ipaddress.IPv4Network]:
+    """Получает список локальных подсетей"""
+    networks = []
+    
+    try:
+        if sys.platform.startswith('win'):
+            # Windows
+            result = subprocess.run(['ipconfig'], capture_output=True, text=True)
+            lines = result.stdout.split('\n')
+            
+            ip = None
+            mask = None
+            
+            for line in lines:
+                line = line.strip()
+                if 'IPv4' in line or 'IP Address' in line:
+                    match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                    if match:
+                        ip = match.group(1)
+                elif 'Subnet Mask' in line or 'Маска подсети' in line:
+                    match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                    if match:
+                        mask = match.group(1)
+                        
+                # Если получили и IP и маску - добавляем сеть
+                if ip and mask and not ip.startswith('127.'):
+                    try:
+                        network = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
+                        networks.append(network)
+                        ip = None
+                        mask = None
+                    except:
+                        pass
+        else:
+            # Linux/Unix
+            result = subprocess.run(['ip', 'route'], capture_output=True, text=True)
+            lines = result.stdout.split('\n')
+            
+            for line in lines:
+                # Ищем строки вида "192.168.1.0/24 dev eth0"
+                match = re.search(r'(\d+\.\d+\.\d+\.\d+/\d+)', line)
+                if match and 'dev' in line and not line.startswith('default'):
+                    try:
+                        network = ipaddress.IPv4Network(match.group(1), strict=False)
+                        # Исключаем loopback и слишком большие сети
+                        if not network.is_loopback and network.prefixlen >= 16:
+                            networks.append(network)
+                    except:
+                        pass
+    except:
+        pass
+    
+    # Если не удалось определить автоматически - добавляем популярные сети
+    if not networks:
+        common_networks = [
+            '192.168.1.0/24',
+            '192.168.0.0/24', 
+            '10.0.0.0/24',
+            '172.16.0.0/24'
+        ]
+        for net_str in common_networks:
+            try:
+                networks.append(ipaddress.IPv4Network(net_str))
+            except:
+                pass
+    
+    return networks
 
 class ESP32UARTBridge:
     def __init__(self, esp32_ip: str, esp32_port: int = 23, virtual_port: Optional[str] = None):
@@ -241,30 +312,52 @@ class ESP32UARTBridge:
             if thread.is_alive():
                 thread.join(timeout=1)
 
-def scan_esp32_devices(start_ip: str = "192.168.1.", port: int = 23) -> list:
-    """Сканирует сеть на наличие ESP32 устройств"""
-    print(f"Сканирование сети {start_ip}1-254 на порту {port}...")
-    found_devices = []
+def scan_esp32_devices(networks: List[ipaddress.IPv4Network] = None, port: int = 23) -> List[str]:
+    """Сканирует локальные сети на наличие ESP32 устройств"""
+    if networks is None:
+        networks = get_local_networks()
     
-    def check_device(ip):
+    print("Сканирование сетей:")
+    for network in networks:
+        print(f"  {network}")
+    print(f"Порт: {port}")
+    
+    found_devices = []
+    scan_lock = threading.Lock()
+    
+    def check_device(ip_str):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
-            result = sock.connect_ex((ip, port))
+            result = sock.connect_ex((ip_str, port))
             sock.close()
             if result == 0:
-                found_devices.append(ip)
-                print(f"Найдено устройство: {ip}")
+                with scan_lock:
+                    found_devices.append(ip_str)
+                    print(f"Найдено устройство: {ip_str}")
         except:
             pass
     
     threads = []
-    for i in range(1, 255):
-        ip = f"{start_ip}{i}"
-        thread = threading.Thread(target=check_device, args=(ip,))
-        thread.start()
-        threads.append(thread)
+    for network in networks:
+        # Ограничиваем сканирование для больших сетей
+        hosts_to_scan = list(network.hosts())
+        if len(hosts_to_scan) > 254:
+            print(f"Сеть {network} слишком большая, пропускаем")
+            continue
+            
+        for host in hosts_to_scan:
+            thread = threading.Thread(target=check_device, args=(str(host),))
+            thread.start()
+            threads.append(thread)
+            
+            # Ограничиваем количество одновременных потоков
+            if len(threads) >= 50:
+                for t in threads:
+                    t.join()
+                threads = []
     
+    # Дожидаемся завершения оставшихся потоков
     for thread in threads:
         thread.join()
     
@@ -276,13 +369,27 @@ def main():
     parser.add_argument('--port', '-p', help='Виртуальный COM-порт (только для Windows)', required=False)
     parser.add_argument('--esp-port', '-e', type=int, default=23, help='Порт ESP32 (по умолчанию 23)')
     parser.add_argument('--scan', '-s', action='store_true', help='Сканировать сеть на наличие ESP32')
+    parser.add_argument('--network', '-n', help='Сеть для сканирования (например 192.168.1.0/24)', action='append')
     
     args = parser.parse_args()
     
+    # Определяем сети для сканирования
+    scan_networks = None
+    if args.network:
+        scan_networks = []
+        for net_str in args.network:
+            try:
+                scan_networks.append(ipaddress.IPv4Network(net_str, strict=False))
+            except Exception as e:
+                print(f"Неверная сеть {net_str}: {e}")
+                return
+    
     if args.scan or not args.ip:
-        devices = scan_esp32_devices()
+        devices = scan_esp32_devices(scan_networks)
         if not devices:
             print("ESP32 устройства не найдены")
+            if not scan_networks:
+                print("Попробуйте указать сеть вручную через --network")
             return
         
         if not args.ip:
