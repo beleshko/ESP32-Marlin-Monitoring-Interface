@@ -9,7 +9,7 @@
 
 **3D Printer monitoring system with composite video output and UART bridge**
 
-[Features](#features) • [Installation](#installation) • [Usage](#usage) • [API](#api) • [Wiring](#wiring-diagram)
+[Features](#features) • [Installation](#installation) • [Usage](#usage) 
 
 </div>
 
